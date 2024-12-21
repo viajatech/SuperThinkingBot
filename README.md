@@ -1,3 +1,6 @@
+![](https://github.com/viajatech/SuperThinkingBot/blob/main/image_fx_%20-%202024-12-21T034632.017.jpg)
+----
+
 # SuperBot Thinking by ViajaTech – README
 
 ¡Bienvenido(a) a **SuperBot Thinking by ViajaTech**! Este es un **chatbot** con interfaz gráfica (GUI) que integra:
