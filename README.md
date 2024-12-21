@@ -7,7 +7,7 @@
 - **Reconocimiento de voz** (speech-to-text)  
 - **Síntesis de voz** con Azure Speech  
 
-> **Créditos a** David Ruiz, conocido como "**Viaja Tech**", por la visión y dirección de este proyecto.
+> **Créditos Apache 2.0 a ** David Ruiz, conocido como "**Viaja Tech**", por la visión y dirección de este proyecto.
 
 ---
 
