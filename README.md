@@ -138,4 +138,4 @@ Este proyecto se distribuye bajo la **Licencia Apache 2.0**:
 - A **Todos mis seguidores por su apoyo en mis múltiples redes sociales** (“Viaja Tech”).
 ---
 
-¡Listo! Espero que este **SuperBot Thinking by ViajaTech** te sea útil como referencia para combinar **Memoria conversacional, TTS, Speech-to-text, y estrategias de test-time compute** con un **modelo** LLM. Si tienes dudas, ¡no dudes en abrir un _issue_ o contactarnos!  
+¡Listo! Espero que este **SuperBot Thinking by ViajaTech** te sea útil como referencia para combinar **Memoria conversacional, TTS, Speech-to-text, y estrategias de test-time compute** con un **modelo** LLM. Si tienes dudas, ¡no dudes en abrir un _issue_ o contactarme!  
