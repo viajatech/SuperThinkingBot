@@ -1,0 +1,957 @@
+#Version (B) Azure Speech SDK by David Ruiz (@viajatech) 
+#by David Ruiz (@viajatech)
+
+#Si utilizas mi script recuerda dar créditos (Apache 2.0) 
+#Se agradece tu estrellita en el repo de github
+#https://github.com/viajatech
+
+#Esta versión es de prueba y es experimental, se recomienda la versión (A) 
+
+"""
+Dependencias necesarias (instálalas con pip install):
+-----------------------------------------------------
+pip install azure-cognitiveservices-speech
+pip install openai
+pip install gradio
+pip install speechrecognition
+pip install TTS
+-----------------------------------------------------
+"""
+
+import gradio as gr
+from openai import OpenAI
+import speech_recognition as sr
+import azure.cognitiveservices.speech as speechsdk
+import random
+
+# =========================================================
+#               CONFIGURACIÓN PRINCIPAL
+# =========================================================
+
+# (MODIFICADO) Configuración de la conexión a LLM STUDIO
+client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
+
+# (MODIFICADO) Configuración de Azure Speech
+speech_key = "TU_CLAVE_DE_AZURE"          # Reemplaza con tu clave de Azure
+service_region = "TU_REGIÓN_DE_SERVICIO"  # Ejemplo: "eastus"
+
+
+# =========================================================
+#               FUNCIONES AUXILIARES
+# =========================================================
+
+def speak_text_azure(text, voice_gender):
+    """Utiliza Azure Speech para convertir texto a voz con la voz seleccionada."""
+    speech_config = speechsdk.SpeechConfig(subscription=speech_key, region=service_region)
+    # Seleccionar la voz según el género
+    if voice_gender == "Femenina":
+        speech_config.speech_synthesis_voice_name = "es-ES-ElviraNeural"
+    else:
+        speech_config.speech_synthesis_voice_name = "es-ES-AlvaroNeural"
+    audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
+    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+    synthesizer.speak_text_async(text)
+
+def transcribe_audio():
+    """Transcribe el audio recibido del micrófono."""
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("Escuchando...")
+        audio = recognizer.listen(source)
+    try:
+        text = recognizer.recognize_google(audio, language='es-ES')
+        return text
+    except sr.UnknownValueError:
+        return "No pude entender el audio."
+    except sr.RequestError as e:
+        return f"Error al conectar con el servicio de reconocimiento de voz: {e}"
+
+def dummy_reward_function(text):
+    """
+    Función de reward de ejemplo (DUMMY).
+    Aquí podrías implementar la lógica real usando:
+    - Un verificador
+    - Un reward model
+    - Heurísticas avanzadas
+    etc.
+    Aquí usamos la longitud del texto (más largo => más 'probable' de ser bueno, 
+    sólo para ejemplificar).
+    """
+    return len(text)
+
+# =========================================================
+#         ESTRATEGIAS DE TEST-TIME COMPUTE SCALING
+# =========================================================
+
+def strategy_simple(context, user_message, depth, model, temperature):
+    """
+    Estrategia 1: Simple.
+    - Se construye un prompt que "emula" un chain-of-thought con 'depth' pasos.
+    - Solo genera UNA respuesta final, pero con una parte "Pensamiento" y otra "Respuesta".
+    """
+    thinking_prompt = f"""
+Eres un potente asistente A.I.
+El usuario dice: "{user_message}"
+
+Primero, genera un razonamiento interno con {depth} niveles de detalle (chain-of-thought).
+Luego, da la respuesta final.
+
+Formato esperado:
+Pensamiento de SuperBot: <explica tu razonamiento de forma extensa, {depth} pasos>
+Respuesta Final: <respuesta concisa>
+    """.strip()
+
+    # Llamamos al modelo una sola vez
+    messages = [
+        {"role": "system", "content": context},
+        {"role": "system", "content": thinking_prompt},
+        {"role": "user",   "content": user_message}
+    ]
+
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error en strategy_simple: {str(e)}"
+
+
+def strategy_best_of_n(context, user_message, n, model, temperature):
+    """
+    Estrategia 2: Best-of-N
+    - Generamos N soluciones con la API.
+    - Aplicamos un reward (dummy_reward_function) a cada una.
+    - Escogemos la que mayor reward tenga.
+    """
+    solutions = []
+    for i in range(n):
+        # Construimos un prompt sencillo para cada "solución"
+        thinking_prompt = f"""
+Eres un potente asistente A.I.
+El usuario dice: "{user_message}"
+
+Genera UNA posible solución y concluye con "Respuesta Final:".
+No muestres tu razonamiento de forma explícita, sólo la respuesta final.
+        """.strip()
+
+        messages = [
+            {"role": "system", "content": context},
+            {"role": "system", "content": thinking_prompt},
+            {"role": "user",   "content": user_message}
+        ]
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature
+            )
+            sol = completion.choices[0].message.content.strip()
+            solutions.append(sol)
+        except Exception as e:
+            solutions.append(f"Error generando: {str(e)}")
+
+    # Escoger la mejor según dummy_reward_function
+    best_solution = None
+    best_score = float("-inf")
+    for sol in solutions:
+        score = dummy_reward_function(sol)
+        if score > best_score:
+            best_score = score
+            best_solution = sol
+
+    return best_solution or "No se encontró solución."
+
+
+def strategy_weighted_best_of_n(context, user_message, n, model, temperature):
+    """
+    Estrategia 3: Weighted Best-of-N
+    - Igual que Best-of-N pero:
+      - Agrupamos soluciones iguales (textualmente).
+      - Sumamos sus scores.
+      - Escogemos la solución con mayor suma total.
+    """
+    from collections import defaultdict
+    solution_scores = defaultdict(float)
+    solution_counts = defaultdict(int)
+
+    for i in range(n):
+        # Prompt simple
+        thinking_prompt = f"""
+Eres un potente asistente A.I.
+El usuario dice: "{user_message}"
+
+Genera UNA posible solución y concluye con "Respuesta Final:".
+        """.strip()
+
+        messages = [
+            {"role": "system", "content": context},
+            {"role": "system", "content": thinking_prompt},
+            {"role": "user",   "content": user_message}
+        ]
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature
+            )
+            sol = completion.choices[0].message.content.strip()
+        except Exception as e:
+            sol = f"Error generando: {str(e)}"
+
+        # calculamos score y acumulamos
+        sc = dummy_reward_function(sol)
+        solution_scores[sol] += sc
+        solution_counts[sol] += 1
+
+    # Buscamos la que tenga mayor sum score
+    best_solution = None
+    best_score_sum = float("-inf")
+
+    for sol, sc_sum in solution_scores.items():
+        if sc_sum > best_score_sum:
+            best_score_sum = sc_sum
+            best_solution = sol
+
+    return best_solution or "No se encontró solución."
+
+
+def strategy_beam_search(context, user_message, beam_iterations, model, temperature):
+    """
+    Estrategia 4: Beam Search (simplificada).
+    - "beam_iterations" se interpreta como el número de pasos a expandir.
+    - Mantenemos un set de "beam" (en este ejemplo, a 3).
+    - En cada iteración, generamos 3 variaciones de cada beam y escogemos las 3 mejores por reward.
+    - Se hace un PROMPT rápido para "continuar" la respuesta. (Muy simplificado)
+    - Al final de las iteraciones, escogemos la mejor respuesta global.
+    """
+    beam_width = 3  # beam size fijo de ejemplo
+    beams = ["(Inicio)"]  # Comienza con un "estado" vacío
+
+    for step in range(beam_iterations):
+        new_beams = []
+        for beam_text in beams:
+            # Generamos beam_width continuaciones
+            for b in range(beam_width):
+                prompt = f"""
+Eres un potente asistente A.I.
+Hasta ahora, tu respuesta parcial es: "{beam_text}"
+Usuario: "{user_message}"
+Genera la continuación de la respuesta. 
+(Al final, concluye con "Respuesta Final:" si ya es tu respuesta final.)
+                """.strip()
+
+                messages = [
+                    {"role": "system", "content": context},
+                    {"role": "system", "content": prompt},
+                ]
+                try:
+                    completion = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature
+                    )
+                    new_text = completion.choices[0].message.content.strip()
+                    combined = beam_text + " " + new_text
+                    new_beams.append(combined)
+                except Exception as e:
+                    new_beams.append(beam_text + f" [Error generando: {str(e)}]")
+
+        # filtrar top beam_width según reward
+        scored_beams = [(b, dummy_reward_function(b)) for b in new_beams]
+        scored_beams.sort(key=lambda x: x[1], reverse=True)
+        beams = [x[0] for x in scored_beams[:beam_width]]
+
+    # de los beams finales, escoger el mejor
+    best_beam = None
+    best_score = float("-inf")
+    for b in beams:
+        sc = dummy_reward_function(b)
+        if sc > best_score:
+            best_score = sc
+            best_beam = b
+
+    return best_beam
+
+
+def strategy_dvts(context, user_message, total_subtrees, model, temperature):
+    """
+    Estrategia 5: DVTS (Diverse Verifier Tree Search) SÚPER simplificada.
+    - "total_subtrees" se toma como N total de "ramas".
+    - Partimos en k subárboles, cada uno se expande con un approach greedy, 
+      intentando "diversificar" un poco el sampling. 
+    - Al final, escogemos la mejor rama por reward.
+    (Implementado de forma muy básica para demostrar la idea.)
+    """
+    # Dividimos el total_subtrees en, p.ej., 3 subárboles. 
+    # Cada subárbol se expande greedy unas pocas veces.
+    sub_arboles = 3
+    expansion_steps = max(1, total_subtrees // sub_arboles)
+
+    # "Raíces" de cada subárbol
+    roots = [f"Raíz_{i}" for i in range(sub_arboles)]
+
+    # Almacenaremos la "rama final" de cada subárbol
+    final_solutions = []
+
+    for root in roots:
+        current_text = root
+        for step in range(expansion_steps):
+            prompt = f"""
+Eres un potente asistente A.I.
+Hasta ahora tu subárbol '{root}' se ha expandido con: "{current_text}"
+Usuario: "{user_message}"
+Sigue expandiendo de forma GREEDY. 
+Concluye en algún momento con "Respuesta Final:".
+            """.strip()
+
+            messages = [
+                {"role": "system", "content": context},
+                {"role": "system", "content": prompt},
+            ]
+            try:
+                completion = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.2  # greedy-ish
+                )
+                new_text = completion.choices[0].message.content.strip()
+                current_text += " " + new_text
+            except Exception as e:
+                current_text += f" [Error DVTS: {str(e)}]"
+                break
+
+        final_solutions.append(current_text)
+
+    # Escogemos la mejor "rama final" de los subárboles
+    best = None
+    best_score = float("-inf")
+    for sol in final_solutions:
+        sc = dummy_reward_function(sol)
+        if sc > best_score:
+            best_score = sc
+            best = sol
+
+    return best
+
+
+# =========================================================
+#     FLUJO PRINCIPAL DE INTERACCIÓN (CHATBOT + UI)
+# =========================================================
+
+def start_chatbot(context, user, bot, temperature, model, voice_gender, strategy, test_time_compute):
+    """
+    Inicia el chatbot con el contexto inicial y configura los estados.
+    """
+    messages = [
+        {"role": "system", "content": context},
+        {"role": "assistant", "content": f"¡Hola {user}! Yo soy {bot}. ¿En qué puedo ayudarte hoy?"}
+    ]
+    chat_history = [{"role": "assistant", "content": messages[-1]['content']}]
+
+    return chat_history, messages, user, bot, temperature, model, voice_gender, strategy, test_time_compute, gr.update(interactive=True)
+
+def chatbot(user_message, messages, user_name, bot_name, temperature, model, strategy, test_time_compute):
+    """
+    Obtiene la respuesta del chatbot usando la estrategia de test-time compute seleccionada.
+    """
+    # Seleccionamos la estrategia
+    if strategy == "Simple":
+        # 'depth' = test_time_compute
+        response = strategy_simple(
+            context=messages[0]["content"],
+            user_message=user_message,
+            depth=test_time_compute,
+            model=model,
+            temperature=temperature
+        )
+    elif strategy == "Best-of-N":
+        # 'n' = test_time_compute
+        response = strategy_best_of_n(
+            context=messages[0]["content"],
+            user_message=user_message,
+            n=test_time_compute,
+            model=model,
+            temperature=temperature
+        )
+    elif strategy == "Weighted Best-of-N":
+        response = strategy_weighted_best_of_n(
+            context=messages[0]["content"],
+            user_message=user_message,
+            n=test_time_compute,
+            model=model,
+            temperature=temperature
+        )
+    elif strategy == "Beam Search":
+        # 'beam_iterations' = test_time_compute
+        response = strategy_beam_search(
+            context=messages[0]["content"],
+            user_message=user_message,
+            beam_iterations=test_time_compute,
+            model=model,
+            temperature=temperature
+        )
+    elif strategy == "DVTS":
+        # 'total_subtrees' = test_time_compute
+        response = strategy_dvts(
+            context=messages[0]["content"],
+            user_message=user_message,
+            total_subtrees=test_time_compute,
+            model=model,
+            temperature=temperature
+        )
+    else:
+        # Por defecto, "Simple"
+        response = strategy_simple(
+            context=messages[0]["content"],
+            user_message=user_message,
+            depth=1,
+            model=model,
+            temperature=temperature
+        )
+
+    # Añadimos la respuesta del asistente al historial
+    messages.append({"role": "user", "content": f"{user_name}: {user_message}"})
+    messages.append({"role": "assistant", "content": response})
+
+    return response, messages
+
+
+def send_message(
+    user_message,
+    chat_history,
+    messages,
+    user_name,
+    bot_name,
+    temperature,
+    model,
+    use_voice,
+    voice_gender,
+    strategy,
+    test_time_compute
+):
+    """Maneja el envío de mensajes y actualiza el historial del chat."""
+    if messages is None:
+        return "Por favor, haz clic en 'Iniciar Chatbot' antes de enviar mensajes.", chat_history, messages
+
+    bot_response, messages = chatbot(
+        user_message,
+        messages,
+        user_name,
+        bot_name,
+        temperature,
+        model,
+        strategy,
+        test_time_compute
+    )
+
+    chat_history.append({"role": "user", "content": f"{user_name}: {user_message}"})
+    chat_history.append({"role": "assistant", "content": f"{bot_name}: {bot_response}"})
+
+    if use_voice:
+        speak_text_azure(bot_response, voice_gender)
+
+    return "", chat_history, messages
+
+
+def clear_history():
+    """Limpia el historial del chat y los estados."""
+    return [], [], "", "", 0.5, "meta-llama-3.1-8b-instruct", "Femenina", "Simple", 1, gr.update(interactive=False)
+
+
+# =========================================================
+#                 INTERFAZ DE GRADIO
+# =========================================================
+
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("<h1 style='color: purple;'>SuperBot Thinking by ViajaTech - Test-time Compute</h1>")
+
+    with gr.Tab("Configuración"):
+        with gr.Row():
+            context = gr.Textbox(
+                label="Contexto o historia inicial",
+                lines=3,
+                value="Eres un potente asistente A.I. Debes ayudar al usuario y razonar antes de responder.",
+            )
+        with gr.Row():
+            user_input = gr.Textbox(label="Tu nombre", value="Usuario")
+            bot_input = gr.Textbox(label="Nombre del chatbot", value="SuperBot Thinking by Viaja Tech")
+        with gr.Row():
+            temperature = gr.Slider(
+                label="Temperatura (creatividad de las respuestas)",
+                minimum=0.0,
+                maximum=1.0,
+                value=0.5,
+                step=0.1,
+            )
+            model = gr.Textbox(
+                label="Modelo de lenguaje (LM Studio)",
+                value="meta-llama-3.1-8b-instruct",
+            )
+        with gr.Row():
+            use_voice = gr.Checkbox(label="Activar salida de voz", value=False)
+            voice_gender = gr.Radio(
+                label="Selecciona la voz del chatbot",
+                choices=["Femenina", "Masculina"],
+                value="Femenina"
+            )
+        with gr.Row():
+            strategy = gr.Radio(
+                label="Estrategia de Test-time Compute Scaling",
+                choices=["Simple", "Best-of-N", "Weighted Best-of-N", "Beam Search", "DVTS"],
+                value="Simple",
+                info="Elige la estrategia que quieras probar."
+            )
+        with gr.Row():
+            test_time_compute = gr.Slider(
+                label="Test-time Compute (mayor => más razonamiento o más iteraciones)",
+                minimum=1,
+                maximum=10,
+                value=1,
+                step=1,
+            )
+        start_button = gr.Button("Iniciar Chatbot")
+
+    with gr.Tab("Chat"):
+        chat_history = gr.Chatbot(type="messages")
+        with gr.Row():
+            message_input = gr.Textbox(label="Escribe tu mensaje...")
+            send_button = gr.Button("Enviar", interactive=False)
+        voice_input_button = gr.Button("Hablar")
+        clear_button = gr.Button("Borrar historial")
+
+    # Estados
+    state_messages = gr.State()
+    state_user_name = gr.State()
+    state_bot_name = gr.State()
+    state_temperature = gr.State()
+    state_model = gr.State()
+    state_voice_gender = gr.State()
+    state_strategy = gr.State()
+    state_test_time = gr.State()
+
+    # Acciones de los botones
+    start_button.click(
+        start_chatbot,
+        inputs=[
+            context,
+            user_input,
+            bot_input,
+            temperature,
+            model,
+            voice_gender,
+            strategy,
+            test_time_compute
+        ],
+        outputs=[
+            chat_history,
+            state_messages,
+            state_user_name,
+            state_bot_name,
+            state_temperature,
+            state_model,
+            state_voice_gender,
+            state_strategy,
+            state_test_time,
+            send_button,  # Habilitar el botón de enviar
+        ],
+    )
+
+    send_button.click(
+        send_message,
+        inputs=[
+            message_input,
+            chat_history,
+            state_messages,
+            state_user_name,
+            state_bot_name,
+            state_temperature,
+            state_model,
+            use_voice,
+            state_voice_gender,
+            state_strategy,
+            state_test_time,
+        ],
+        outputs=[message_input, chat_history, state_messages],
+    )
+
+    voice_input_button.click(
+        transcribe_audio,
+        inputs=None,
+        outputs=message_input,
+    )
+
+    clear_button.click(
+        clear_history,
+        outputs=[
+            chat_history,
+            state_messages,
+            state_user_name,
+            state_bot_name,
+            state_temperature,
+            state_model,
+            state_voice_gender,
+            state_strategy,
+            state_test_time,
+            send_button,  # Deshabilitar el botón de enviar
+        ],
+    )
+
+    demo.launch(share=True)
+
+# (AQUÍ TERMINAN LAS 593 LÍNEAS ORIGINALES)
+# =========================================================
+#               LÍNEAS EXTRA PARA "MEMORIA"
+# =========================================================
+# A partir de aquí, simplemente añadimos lógica que
+# fuerza a que cada estrategia considere el historial
+# (messages) completo, de forma que el chatbot recuerde
+# todo lo que se ha dicho previamente en la conversación.
+
+# Línea 594:
+# NOTA: El "messages" que estamos usando en las llamadas
+#       a la función client.chat.completions.create() 
+#       se redefine en cada estrategia. Para retener la 
+#       conversación previa, podemos concatenarla en 
+#       cada llamada. Mantendremos "messages" completo.
+
+# Línea 595:
+# EJEMPLO: Ajustamos las estrategias para que en vez de
+#          usar "messages[0]['content']" como "context",
+#          construya un 'historial_prompt' con todos los
+#          mensajes (except system messages) para la
+#          "memoria". Esto es un apéndice.
+
+# Línea 596 (sólo demostrativo):
+def build_conversation_prompt(messages):
+    """
+    Construye un prompt que contenga todo el historial 
+    anterior de la conversación (user + assistant),
+    excepto el primer "system" con el contexto,
+    para que el modelo tenga memoria de lo ocurrido.
+    """
+    conversation = []
+    # El primer mensaje con role=system es el contexto global.
+    # Conservamos todos los demás.
+    for idx, msg in enumerate(messages):
+        if idx == 0:
+            # Este es el contexto, lo dejamos aparte.
+            continue
+        if msg["role"] == "user":
+            conversation.append(f"Usuario: {msg['content']}")
+        elif msg["role"] == "assistant":
+            conversation.append(f"Asistente: {msg['content']}")
+        elif msg["role"] == "system":
+            conversation.append(f"(System) {msg['content']}")
+    return "\n".join(conversation)
+
+# Línea 597:
+# A continuación, inyectamos la "conversación previa" en
+# cada estrategia. Añadimos llamadas a "build_conversation_prompt"
+# y concatenamos al "context" original.
+
+# Línea 598:
+# Reemplazaremos la parte donde se llamaba messages[0]["content"]
+# con algo que lleve el historial. Se hace en cada
+# strategy, sin modificar las existentes, sino
+# extendiéndolas con un "if" extra.
+
+# Línea 599: (Ejemplo)
+original_strategy_simple = strategy_simple  # copiamos la ref
+
+def strategy_simple(context, user_message, depth, model, temperature, full_messages=None):
+    # Si full_messages se pasa, construimos un "historial_prompt"
+    if full_messages:
+        conversation_prompt = build_conversation_prompt(full_messages)
+        context = f"{context}\n\nHistorial de la conversación previa:\n{conversation_prompt}"
+
+    thinking_prompt = f"""
+Eres un potente asistente A.I.
+El usuario dice: "{user_message}"
+
+Primero, genera un razonamiento interno con {depth} niveles de detalle (chain-of-thought).
+Luego, da la respuesta final.
+
+Formato esperado:
+Pensamiento de SuperBot: <explica tu razonamiento de forma extensa, {depth} pasos>
+Respuesta Final: <respuesta concisa>
+    """.strip()
+
+    messages = [
+        {"role": "system", "content": context},
+        {"role": "system", "content": thinking_prompt},
+        {"role": "user",   "content": user_message}
+    ]
+
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error en strategy_simple: {str(e)}"
+
+# Línea 600: Repetimos para best_of_n
+original_strategy_best_of_n = strategy_best_of_n
+
+def strategy_best_of_n(context, user_message, n, model, temperature, full_messages=None):
+    if full_messages:
+        conversation_prompt = build_conversation_prompt(full_messages)
+        context = f"{context}\n\nHistorial de la conversación previa:\n{conversation_prompt}"
+    solutions = []
+    for i in range(n):
+        thinking_prompt = f"""
+Eres un potente asistente A.I.
+El usuario dice: "{user_message}"
+
+Genera UNA posible solución y concluye con "Respuesta Final:".
+No muestres tu razonamiento de forma explícita, sólo la respuesta final.
+        """.strip()
+
+        messages = [
+            {"role": "system", "content": context},
+            {"role": "system", "content": thinking_prompt},
+            {"role": "user",   "content": user_message}
+        ]
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature
+            )
+            sol = completion.choices[0].message.content.strip()
+            solutions.append(sol)
+        except Exception as e:
+            solutions.append(f"Error generando: {str(e)}")
+
+    best_solution = None
+    best_score = float("-inf")
+    for sol in solutions:
+        score = dummy_reward_function(sol)
+        if score > best_score:
+            best_score = score
+            best_solution = sol
+    return best_solution or "No se encontró solución."
+
+# Línea 601: Weighted
+original_strategy_weighted_best_of_n = strategy_weighted_best_of_n
+
+def strategy_weighted_best_of_n(context, user_message, n, model, temperature, full_messages=None):
+    if full_messages:
+        conversation_prompt = build_conversation_prompt(full_messages)
+        context = f"{context}\n\nHistorial de la conversación previa:\n{conversation_prompt}"
+    from collections import defaultdict
+    solution_scores = defaultdict(float)
+    solution_counts = defaultdict(int)
+
+    for i in range(n):
+        thinking_prompt = f"""
+Eres un potente asistente A.I.
+El usuario dice: "{user_message}"
+
+Genera UNA posible solución y concluye con "Respuesta Final:".
+        """.strip()
+
+        messages = [
+            {"role": "system", "content": context},
+            {"role": "system", "content": thinking_prompt},
+            {"role": "user",   "content": user_message}
+        ]
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature
+            )
+            sol = completion.choices[0].message.content.strip()
+        except Exception as e:
+            sol = f"Error generando: {str(e)}"
+
+        sc = dummy_reward_function(sol)
+        solution_scores[sol] += sc
+        solution_counts[sol] += 1
+
+    best_solution = None
+    best_score_sum = float("-inf")
+    for sol, sc_sum in solution_scores.items():
+        if sc_sum > best_score_sum:
+            best_score_sum = sc_sum
+            best_solution = sol
+    return best_solution or "No se encontró solución."
+
+# Línea 602: Beam
+original_strategy_beam_search = strategy_beam_search
+
+def strategy_beam_search(context, user_message, beam_iterations, model, temperature, full_messages=None):
+    if full_messages:
+        conversation_prompt = build_conversation_prompt(full_messages)
+        context = f"{context}\n\nHistorial de la conversación previa:\n{conversation_prompt}"
+    beam_width = 3
+    beams = ["(Inicio)"]
+
+    for step in range(beam_iterations):
+        new_beams = []
+        for beam_text in beams:
+            for b in range(beam_width):
+                prompt = f"""
+Eres un potente asistente A.I.
+Hasta ahora, tu respuesta parcial es: "{beam_text}"
+Usuario: "{user_message}"
+Genera la continuación de la respuesta. 
+(Al final, concluye con "Respuesta Final:" si ya es tu respuesta final.)
+                """.strip()
+
+                messages = [
+                    {"role": "system", "content": context},
+                    {"role": "system", "content": prompt},
+                ]
+                try:
+                    completion = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature
+                    )
+                    new_text = completion.choices[0].message.content.strip()
+                    combined = beam_text + " " + new_text
+                    new_beams.append(combined)
+                except Exception as e:
+                    new_beams.append(beam_text + f" [Error generando: {str(e)}]")
+
+        scored_beams = [(b, dummy_reward_function(b)) for b in new_beams]
+        scored_beams.sort(key=lambda x: x[1], reverse=True)
+        beams = [x[0] for x in scored_beams[:beam_width]]
+
+    best_beam = None
+    best_score = float("-inf")
+    for b in beams:
+        sc = dummy_reward_function(b)
+        if sc > best_score:
+            best_score = sc
+            best_beam = b
+    return best_beam
+
+# Línea 603: DVTS
+original_strategy_dvts = strategy_dvts
+
+def strategy_dvts(context, user_message, total_subtrees, model, temperature, full_messages=None):
+    if full_messages:
+        conversation_prompt = build_conversation_prompt(full_messages)
+        context = f"{context}\n\nHistorial de la conversación previa:\n{conversation_prompt}"
+
+    sub_arboles = 3
+    expansion_steps = max(1, total_subtrees // sub_arboles)
+    roots = [f"Raíz_{i}" for i in range(sub_arboles)]
+    final_solutions = []
+
+    for root in roots:
+        current_text = root
+        for step in range(expansion_steps):
+            prompt = f"""
+Eres un potente asistente A.I.
+Hasta ahora tu subárbol '{root}' se ha expandido con: "{current_text}"
+Usuario: "{user_message}"
+Sigue expandiendo de forma GREEDY. 
+Concluye en algún momento con "Respuesta Final:".
+            """.strip()
+
+            messages = [
+                {"role": "system", "content": context},
+                {"role": "system", "content": prompt},
+            ]
+            try:
+                completion = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.2
+                )
+                new_text = completion.choices[0].message.content.strip()
+                current_text += " " + new_text
+            except Exception as e:
+                current_text += f" [Error DVTS: {str(e)}]"
+                break
+
+        final_solutions.append(current_text)
+
+    best = None
+    best_score = float("-inf")
+    for sol in final_solutions:
+        sc = dummy_reward_function(sol)
+        if sc > best_score:
+            best_score = sc
+            best = sol
+    return best
+
+# Línea 604:
+# Reemplazamos en "chatbot(...)" las llamadas a las funciones
+# strategy_simple, strategy_best_of_n, etc., para que
+# les pasemos "full_messages=messages" y así integren
+# el historial. 
+# Actualizamos la función "chatbot" existente:
+
+import types
+old_chatbot = chatbot
+
+def chatbot(user_message, messages, user_name, bot_name, temperature, model, strategy, test_time_compute):
+    if strategy == "Simple":
+        response = strategy_simple(
+            context=messages[0]["content"],
+            user_message=user_message,
+            depth=test_time_compute,
+            model=model,
+            temperature=temperature,
+            full_messages=messages  # <--- se añade
+        )
+    elif strategy == "Best-of-N":
+        response = strategy_best_of_n(
+            context=messages[0]["content"],
+            user_message=user_message,
+            n=test_time_compute,
+            model=model,
+            temperature=temperature,
+            full_messages=messages  # <---
+        )
+    elif strategy == "Weighted Best-of-N":
+        response = strategy_weighted_best_of_n(
+            context=messages[0]["content"],
+            user_message=user_message,
+            n=test_time_compute,
+            model=model,
+            temperature=temperature,
+            full_messages=messages  # <---
+        )
+    elif strategy == "Beam Search":
+        response = strategy_beam_search(
+            context=messages[0]["content"],
+            user_message=user_message,
+            beam_iterations=test_time_compute,
+            model=model,
+            temperature=temperature,
+            full_messages=messages  # <---
+        )
+    elif strategy == "DVTS":
+        response = strategy_dvts(
+            context=messages[0]["content"],
+            user_message=user_message,
+            total_subtrees=test_time_compute,
+            model=model,
+            temperature=temperature,
+            full_messages=messages  # <---
+        )
+    else:
+        response = strategy_simple(
+            context=messages[0]["content"],
+            user_message=user_message,
+            depth=1,
+            model=model,
+            temperature=temperature,
+            full_messages=messages  # <---
+        )
+    messages.append({"role": "user", "content": f"{user_name}: {user_message}"})
+    messages.append({"role": "assistant", "content": response})
+    return response, messages
+
+# *** Fin de modificaciones para la "memoria" ***
